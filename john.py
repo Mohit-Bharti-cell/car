@@ -1,14 +1,11 @@
 from flask import Flask, request, jsonify
-import pyodbc
 import cloudinary
 import cloudinary.uploader
-import boto3
-from dotenv import load_dotenv
-from flask_cors import CORS
 import os
 import logging
-from uuid import uuid4
-import requests
+from dotenv import load_dotenv
+from flask_cors import CORS
+import pyodbc
 
 # Load environment variables from .env file
 load_dotenv()
@@ -28,41 +25,24 @@ cloudinary.config(
     api_secret=os.getenv("CLOUDINARY_API_SECRET"),
 )
 
-# AWS S3 Configuration
-s3 = boto3.client(
-    's3',
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-    region_name=os.getenv('AWS_REGION')
-)
-
-S3_BUCKET = os.getenv('S3_BUCKET_NAME')
-
 # Azure SQL Database configuration
 db_config = {
-    'server': os.getenv('AZURE_SQL_SERVER'),  # Azure SQL Server name
-    'database': os.getenv('AZURE_SQL_DATABASE'),  # Database name (car_rent)
-    'user': os.getenv('AZURE_SQL_USER'),  # Database username
-    'password': os.getenv('AZURE_SQL_PASSWORD'),  # Database password
+    'server': os.getenv('AZURE_SQL_SERVER'),
+    'database': os.getenv('AZURE_SQL_DATABASE'),
+    'user': os.getenv('AZURE_SQL_USER'),
+    'password': os.getenv('AZURE_SQL_PASSWORD'),
 }
 
 # Table name
-table_name = 'cars'  # Your table name in the database
+table_name = 'cars'
 
-# Utility function to check if a URL is accessible
-def is_url_accessible(url):
+# Function to upload an image to Cloudinary
+def upload_image_to_cloudinary(file):
     try:
-        response = requests.head(url, timeout=5)
-        return response.status_code == 200
-    except requests.RequestException as e:
-        logger.error(f"URL access error: {e}")
-        return False
-
-# Function to upload an image from S3 to Cloudinary
-def upload_image_to_cloudinary_from_s3(s3_url):
-    try:
-        response = cloudinary.uploader.upload(s3_url)
-        return response.get("secure_url")
+        # Upload to Cloudinary
+        response = cloudinary.uploader.upload(file)
+        logger.info(f"Image uploaded to Cloudinary: {response['secure_url']}")
+        return response['secure_url']
     except Exception as e:
         logger.error(f"Error uploading image to Cloudinary: {e}")
         return None
@@ -96,14 +76,15 @@ def insert_car_details(car_name, segment_id, segment_name, model_type, year, eng
 
 @app.route('/upload_car', methods=['POST'])
 def upload_car():
-    data = request.json
+    data = request.form  # Get form-data (including files)
 
     # Validate required fields
-    required_fields = ['car_name', 'segment_id', 'segment_name', 'model_type', 'year', 'engine_type', 'fuel_type', 'price', 'image_paths']
+    required_fields = ['car_name', 'segment_id', 'segment_name', 'model_type', 'year', 'engine_type', 'fuel_type', 'price']
     for field in required_fields:
         if field not in data:
             return jsonify({"error": f"Missing required field: {field}"}), 400
 
+    # Get car details from the form-data
     car_name = data['car_name']
     segment_id = data['segment_id']
     segment_name = data['segment_name']
@@ -112,28 +93,31 @@ def upload_car():
     engine_type = data['engine_type']
     fuel_type = data['fuel_type']
     price = data['price']
-    image_paths = data['image_paths']  # Dictionary of S3 image file paths
 
+    # Process images
     image_urls = {}
     errors = {}
 
-    # Upload images from S3 to Cloudinary
-    for column, s3_url in image_paths.items():
-        if not is_url_accessible(s3_url):
-            errors[column] = f"S3 URL for {column} is not accessible"
-            continue
-
-        image_url = upload_image_to_cloudinary_from_s3(s3_url)
-        if image_url:
-            image_urls[column] = image_url
+    image_fields = ['image_data', 'front_view', 'back_view', 'left_side_view', 'right_side_view']
+    for field in image_fields:
+        if field in request.files:
+            image_file = request.files[field]
+            logger.info(f"Processing {field}: {image_file.filename}")
+            # Upload the image to Cloudinary
+            image_url = upload_image_to_cloudinary(image_file)
+            if image_url:
+                image_urls[field] = image_url
+            else:
+                errors[field] = f"Failed to upload image for {field}"
         else:
-            errors[column] = f"Failed to upload image for {column}"
+            errors[field] = f"File not found for {field}"
 
+    # If there are errors, return them
     if errors:
         return jsonify({"error": "Some images failed to upload", "details": errors}), 207  # Multi-Status
 
     try:
-        # Updated Azure SQL Database connection
+        # Connect to Azure SQL Database
         conn = pyodbc.connect(
             f"Driver={{ODBC Driver 18 for SQL Server}};"
             f"Server={db_config['server']},1433;"
