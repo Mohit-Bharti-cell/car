@@ -11,6 +11,6 @@ RUN apt-get update && apt-get install -y \
     unixodbc \
     unixodbc-dev && \
     curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg && \
-    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/config/debian/11/prod.list" > /etc/apt/sources.list.d/mssql-release.list && \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/11/prod bullseye main" > /etc/apt/sources.list.d/mssql-release.list && \
     apt-get update && apt-get install -y msodbcsql18 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
