@@ -3,19 +3,20 @@ import os
 import cloudinary
 import cloudinary.uploader
 import pyodbc
-import cv2
-import numpy as np
-import urllib.request
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from flask_restx import Api, Resource, fields
 from flask_cors import CORS
 from dotenv import load_dotenv
+import urllib
+import numpy as np
+import cv2
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Cloudinary Configuration
 cloudinary.config(
@@ -26,10 +27,10 @@ cloudinary.config(
 
 # Database Configuration from .env file
 db_config = {
-    'server': os.getenv('AZURE_SQL_SERVER'),  # Azure SQL Server name
-    'database': os.getenv('AZURE_SQL_DATABASE'),  # Database name
-    'user': os.getenv('AZURE_SQL_USER'),  # Database username
-    'password': os.getenv('AZURE_SQL_PASSWORD'),  # Database password
+    'server': os.getenv('AZURE_SQL_SERVER'),
+    'database': os.getenv('AZURE_SQL_DATABASE'),
+    'user': os.getenv('AZURE_SQL_USER'),
+    'password': os.getenv('AZURE_SQL_PASSWORD'),
 }
 
 # Flask app and API initialization
@@ -41,68 +42,17 @@ CORS(app)
 image_upload_model = api.model('ImageUpload', {
     'segment_id': fields.Integer(required=True, description='Segment ID of the car'),
     'model_type': fields.String(required=True, description='Model type of the car'),
-    'image_paths': fields.Raw(required=True, description='A dictionary of S3 image paths with column names as keys')
+    # Removed 'image_paths' since files are being sent as multipart data
 })
 
-
-def convert_s3_to_cloudinary(s3_url):
-    """Upload image from S3 URL to Cloudinary and return the Cloudinary URL."""
+def upload_image_to_cloudinary(file):
     try:
-        response = cloudinary.uploader.upload(s3_url)
-        cloudinary_url = response['secure_url']
-        logging.info(f"Image successfully uploaded to Cloudinary: {cloudinary_url}")
-        return cloudinary_url
+        response = cloudinary.uploader.upload(file)
+        logger.info(f"Image uploaded to Cloudinary: {response['secure_url']}")
+        return response['secure_url']
     except Exception as e:
-        logging.error(f"Error uploading to Cloudinary: {e}")
+        logger.error(f"Error uploading image to Cloudinary: {e}")
         return None
-
-
-def retrieve_image_url_from_db(segment_id, model_type, column, db_config):
-    """Retrieve the image URL for the specified segment_id and model_type from the database."""
-    try:
-        conn_str = (
-            f"Driver={{ODBC Driver 18 for SQL Server}};"
-            f"Server={db_config['server']},1433;"  # Azure SQL Server
-            f"Database={db_config['database']};"   # Azure SQL Database
-            f"UID={db_config['user']};"             # Database username
-            f"PWD={db_config['password']};"         # Database password
-        )
-        conn = pyodbc.connect(conn_str)
-        cursor = conn.cursor()
-
-        query = f"""
-            SELECT car_id, segment_id, segment_name, model_type, {column}
-            FROM cars
-            WHERE model_type = ? AND segment_id = ?
-        """
-        
-        cursor.execute(query, (model_type, segment_id))
-        results = cursor.fetchall()
-
-        if results:
-            cars = []
-            for row in results:
-                cars.append({
-                    'car_id': row[0],
-                    'segment_id': row[1],
-                    'segment_name': row[2],
-                    'model_type': row[3],
-                    'image_url': row[4]
-                })
-            logging.info(f"Successfully retrieved image URLs for segment_id '{segment_id}' and model_type '{model_type}'.")
-            return cars
-        else:
-            logging.warning(f"No cars found for model_type '{model_type}' and segment_id '{segment_id}'.")
-            return []
-    except pyodbc.Error as e:
-        logging.error(f"Error retrieving image URLs for segment_id '{segment_id}' and model_type '{model_type}': {e}")
-        return []
-    finally:
-        if 'cursor' in locals():
-            cursor.close()
-        if 'conn' in locals():
-            conn.close()
-
 
 def detect_scratches_or_differences(new_image_url, existing_image_url):
     """Detect scratches or differences between the new image and the existing image."""
@@ -114,16 +64,14 @@ def detect_scratches_or_differences(new_image_url, existing_image_url):
         if new_image is None:
             logging.error("Failed to load the new image from Cloudinary.")
             return False
-        logging.info(f"New image loaded from {new_image_url}")
 
-        # Load existing image from the URL
+        # Load existing image from the URL in database
         with urllib.request.urlopen(existing_image_url) as resp:
             existing_image_data = np.asarray(bytearray(resp.read()), dtype="uint8")
         existing_image = cv2.imdecode(existing_image_data, cv2.IMREAD_GRAYSCALE)
         if existing_image is None:
             logging.error("Failed to load the existing image from the database.")
             return True
-        logging.info(f"Existing image loaded from {existing_image_url}")
 
         # Resize images to the same dimensions
         height, width = 500, 500
@@ -163,64 +111,104 @@ def detect_scratches_or_differences(new_image_url, existing_image_url):
         logging.error(f"Error detecting scratches or differences in images: {e}")
         return False
 
+def retrieve_image_url_from_db(segment_id, model_type, column, db_config):
+    """
+    Retrieves an image URL from the database for the specified segment ID, model type, and column.
+    """
+    try:
+        conn_str = (
+            f"Driver={{ODBC Driver 17 for SQL Server}};"
+            f"Server={db_config['server']};"
+            f"Database={db_config['database']};"
+            f"UID={db_config['user']};"
+            f"PWD={db_config['password']};"
+            f"Encrypt=yes;TrustServerCertificate=no;Connection Timeout=300;"
+        )
+        conn = pyodbc.connect(conn_str)
 
-def update_images_for_segment(segment_id, model_type, image_paths, db_config):
-    """Update Cloudinary image URLs for all cars matching the model_type and segment_id in the database."""
+        cursor = conn.cursor()
+        query = f"SELECT {column} AS image_url FROM cars WHERE segment_id = ? AND model_type = ?"
+        cursor.execute(query, (segment_id, model_type))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return [{'image_url': row.image_url} for row in rows]
+    except Exception as e:
+        logger.error(f"Error retrieving image URL from database: {e}")
+        return []
+
+def update_images_for_segment(segment_id, model_type, files, db_config):
+    """
+    Updates images for a specific car segment by uploading to Cloudinary and updating the database.
+    """
     result = []
-
-    for column, s3_image_url in image_paths.items():
-        # Step 1: Convert S3 URL to Cloudinary URL
-        cloudinary_url = convert_s3_to_cloudinary(s3_image_url)
+    for column, file in files.items():
+        # Upload image to Cloudinary
+        cloudinary_url = upload_image_to_cloudinary(file)
         if not cloudinary_url:
             result.append({'column': column, 'status': 'Failed to upload to Cloudinary'})
             continue
 
-        # Step 2: Retrieve database image URLs
+        # Retrieve existing image URLs from the database
         cars = retrieve_image_url_from_db(segment_id, model_type, column, db_config)
-
         for car in cars:
             existing_image_url = car['image_url']
-
-            if existing_image_url:
-                issues_detected = detect_scratches_or_differences(cloudinary_url, existing_image_url)
-                if issues_detected:
-                    try:
-                        conn_str = (
-                            f"Driver={{ODBC Driver 18 for SQL Server}};"
-                            f"Server={db_config['server']};"
-                            f"Database={db_config['database']};"
-                            f"UID={db_config['user']};"
-                            f"PWD={db_config['password']};"
-                        )
-                        conn = pyodbc.connect(conn_str)
-                        cursor = conn.cursor()
-                        cursor.execute(f"UPDATE cars SET {column} = ? WHERE segment_id = ? AND model_type = ?", (cloudinary_url, segment_id, model_type))
-                        conn.commit()
-                        cursor.close()
-                        conn.close()
-                        result.append({'column': column, 'status': 'Scratch detected and image updated'})
-                    except Exception as e:
-                        result.append({'column': column, 'status': f'Error: {e}'})
-                else:
-                    result.append({'column': column, 'status': 'No change'})
+            scratch_detected = detect_scratches_or_differences(cloudinary_url, existing_image_url)
+            
+            # If scratch detected, update the database
+            if scratch_detected:
+                try:
+                    # Update the database with the new Cloudinary URL
+                    conn_str = (
+                        f"Driver={{ODBC Driver 18 for SQL Server}};"
+                        f"Server={db_config['server']};"
+                        f"Database={db_config['database']};"
+                        f"UID={db_config['user']};"
+                        f"PWD={db_config['password']};"
+                    )
+                    conn = pyodbc.connect(conn_str)
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        f"UPDATE cars SET {column} = ? WHERE segment_id = ? AND model_type = ?",
+                        (cloudinary_url, segment_id, model_type)
+                    )
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+                    result.append({'column': column, 'status': 'Updated with scratches detected'})
+                except Exception as e:
+                    result.append({'column': column, 'status': f'Error updating DB: {e}'})
+            else:
+                result.append({'column': column, 'status': 'No scratch detected, no update made'})
+                
     return result
 
-
-@api.route('/upload-images')
-class UploadImages(Resource):
-    @api.expect(image_upload_model)
+@api.route('/upload-images-with-keys')
+class UploadImagesWithKeys(Resource):
+    @api.expect(image_upload_model)  # Model validation for API input
     def post(self):
-        data = request.json
-        segment_id = data.get('segment_id')
-        model_type = data.get('model_type')
-        image_paths = data.get('image_paths')
+        try:
+            # Get segment_id and model_type
+            segment_id = request.form.get('segment_id')
+            model_type = request.form.get('model_type')
 
-        if not segment_id or not model_type or not image_paths:
-            return {'status': 'error', 'message': 'Invalid input parameters'}, 400
+            # Get files from the form
+            image_files = request.files.to_dict()
 
-        result = update_images_for_segment(segment_id, model_type, image_paths, db_config)
-        return result, 200
+            # Validate input parameters
+            if not segment_id or not model_type or not image_files:
+                return {'status': 'error', 'message': 'Invalid input parameters'}, 400
 
+            logger.info(f"Received segment_id: {segment_id}, model_type: {model_type}")
 
-if __name__ == '__main__':
-    app.run(debug=True)
+            # Update the database with Cloudinary URLs
+            result = update_images_for_segment(segment_id, model_type, image_files, db_config)
+
+            return {'status': 'success', 'data': result}, 200
+
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            return {'status': 'error', 'message': 'Server error, please try again later'}, 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
